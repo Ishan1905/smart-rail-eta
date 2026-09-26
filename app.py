@@ -204,7 +204,7 @@ def get_live_prediction():
 
     rail_url = (
         f"https://api.railradar.in/v1/trains/"
-        f"{TRAIN_NUMBER}/live"
+        f"{TRAIN_NUMBER}/live?authoritative=true&includeCoordinates=true"
     )
 
     try:
