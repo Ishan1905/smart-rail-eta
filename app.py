@@ -24,11 +24,25 @@ OPENWEATHER_API_KEY = os.environ.get("OPENWEATHER_API_KEY")
 # LOAD TRAINED MODEL
 # ============================================================
 
-artifact = joblib.load(MODEL_PATH)
+MODEL_PATH = "railway_eta_recovered_model.joblib"
 
-xgb_model = artifact["model"]
-preprocessor = artifact["preprocessor"]
-feature_columns = artifact["feature_columns"]
+xgb_model = None
+preprocessor = None
+feature_columns = None
+
+
+def load_model():
+    global xgb_model, preprocessor, feature_columns
+
+    if xgb_model is None:
+        print("Loading ETA model...")
+        artifact = joblib.load(MODEL_PATH)
+
+        xgb_model = artifact["model"]
+        preprocessor = artifact["preprocessor"]
+        feature_columns = artifact["feature_columns"]
+
+        print("ETA model loaded successfully.")
 
 
 # ============================================================
@@ -161,6 +175,9 @@ def calculate_fog_risk(visibility_km, humidity):
 # ============================================================
 
 def get_live_prediction():
+    load_model()
+
+    
 
     # --------------------------------------------------------
     # Check API keys
