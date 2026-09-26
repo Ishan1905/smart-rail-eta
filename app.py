@@ -750,6 +750,19 @@ def get_live_prediction():
         "Unknown",
     )
 
+    # Live train status used by the dashboard header and status card.
+    status = rail.get("status", "unknown")
+    live_status = (
+        "LIVE"
+        if str(status).lower() in {
+            "running",
+            "enroute",
+            "on-route",
+            "active",
+        }
+        else str(status).title()
+    )
+
     fog_effect_display = (
         f"+{fog_delay_effect:.2f} min"
         if fog_delay_effect >= 0
