@@ -27,6 +27,10 @@ xgb_model = None
 preprocessor = None
 feature_columns = None
 
+# Previous live telemetry snapshots used only to estimate current speed
+# when RailRadar does not return a usable speed value.
+SPEED_HISTORY = {}
+
 
 def load_model():
     global xgb_model, preprocessor, feature_columns
@@ -117,6 +121,179 @@ def calculate_fog_risk(visibility_km, humidity):
     score = 0.32 + raw_score * (0.88 - 0.32)
 
     return float(max(0.32, min(0.88, score)))
+
+
+# ============================================================
+# LIVE SPEED / SEGMENT HELPERS
+# ============================================================
+
+def _safe_float(value):
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _extract_speed(value):
+    """Extract a numeric km/h speed from common RailRadar fields."""
+    if isinstance(value, (int, float)):
+        return float(value)
+
+    if isinstance(value, str):
+        import re
+        match = re.search(r"[-+]?\\d+(?:\\.\\d+)?", value)
+        if match:
+            return float(match.group())
+        return None
+
+    return None
+
+
+def _haversine_km(lat1, lon1, lat2, lon2):
+    from math import radians, sin, cos, asin, sqrt
+
+    try:
+        lat1, lon1, lat2, lon2 = map(
+            float, (lat1, lon1, lat2, lon2)
+        )
+    except (TypeError, ValueError):
+        return None
+
+    r = 6371.0
+    dlat = radians(lat2 - lat1)
+    dlon = radians(lon2 - lon1)
+
+    a = (
+        sin(dlat / 2) ** 2
+        + cos(radians(lat1))
+        * cos(radians(lat2))
+        * sin(dlon / 2) ** 2
+    )
+
+    return 2 * r * asin(sqrt(a))
+
+
+def get_segment_context(current, route, lat, lon):
+    """Return a human-readable current segment and its approximate length."""
+    current_code = current.get("stationCode")
+    current_seq = current.get("sequence")
+
+    current_index = None
+
+    for i, stop in enumerate(route):
+        if current_code and stop.get("stationCode") == current_code:
+            current_index = i
+            break
+        if current_seq is not None and stop.get("sequence") == current_seq:
+            current_index = i
+            break
+
+    next_stop = None
+    previous_stop = None
+
+    if current_index is not None:
+        if current_index + 1 < len(route):
+            next_stop = route[current_index + 1]
+        if current_index > 0:
+            previous_stop = route[current_index - 1]
+
+    # Some RailRadar responses may explicitly provide next station info.
+    next_code = (
+        current.get("nextStationCode")
+        or current.get("nextStation", {}).get("stationCode")
+        if isinstance(current.get("nextStation"), dict)
+        else current.get("nextStationCode")
+    )
+
+    if next_code and current_index is not None:
+        for stop in route:
+            if stop.get("stationCode") == next_code:
+                next_stop = stop
+                break
+
+    start_name = (
+        previous_stop.get("stationName")
+        if previous_stop
+        else current.get("stationName", "Current location")
+    )
+    end_name = (
+        next_stop.get("stationName")
+        if next_stop
+        else "Next station"
+    )
+
+    segment_label = f"{start_name} → {end_name}"
+
+    segment_distance_km = None
+
+    if previous_stop and next_stop:
+        d1 = _safe_float(previous_stop.get("distance"))
+        d2 = _safe_float(next_stop.get("distance"))
+        if d1 is not None and d2 is not None:
+            segment_distance_km = abs(d2 - d1)
+
+    if segment_distance_km is None and next_stop:
+        segment_distance_km = _haversine_km(
+            lat,
+            lon,
+            next_stop.get("lat"),
+            next_stop.get("lng"),
+        )
+
+    if segment_distance_km is None or segment_distance_km <= 0:
+        segment_distance_km = None
+
+    return segment_label, segment_distance_km
+
+
+def estimate_speed_from_progress(
+    train_number,
+    segment_key,
+    segment_progress,
+    segment_distance_km,
+    timestamp,
+):
+    """Estimate km/h from movement between two live refreshes."""
+    if (
+        segment_progress is None
+        or segment_distance_km is None
+        or segment_distance_km <= 0
+    ):
+        return None
+
+    previous = SPEED_HISTORY.get(train_number)
+    SPEED_HISTORY[train_number] = {
+        "segment_key": segment_key,
+        "progress": segment_progress,
+        "timestamp": timestamp,
+    }
+
+    if not previous:
+        return None
+
+    if previous["segment_key"] != segment_key:
+        return None
+
+    elapsed_hours = (
+        timestamp - previous["timestamp"]
+    ).total_seconds() / 3600.0
+
+    delta_progress = segment_progress - previous["progress"]
+
+    if elapsed_hours <= 0 or delta_progress <= 0:
+        return None
+
+    speed = (
+        delta_progress
+        * segment_distance_km
+        / elapsed_hours
+    )
+
+    # Reject impossible telemetry jumps.
+    if 1 <= speed <= 180:
+        return float(speed)
+
+    return None
 
 
 # ============================================================
@@ -219,47 +396,89 @@ def get_live_prediction():
     )
 
     # --------------------------------------------------------
-    # CURRENT SPEED
-    # RailRadar may expose speed under different field names.
+    # CURRENT SPEED + SEGMENT
     # --------------------------------------------------------
 
-    raw_speed = (
-        current.get("speedKmh")
-        if current.get("speedKmh") is not None
-        else current.get("speed")
-    )
+    now = datetime.now(ZoneInfo("Asia/Kolkata"))
 
-    if raw_speed is None:
-        raw_speed = current.get("speedKmph")
+    # RailRadar documents speed inside currentLocation. Try the
+    # documented field plus common aliases/nested telemetry fields.
+    speed_candidates = [
+        current.get("speedKmh"),
+        current.get("speed"),
+        current.get("speedKmph"),
+        current.get("speed_kmh"),
+        current.get("speed_kmph"),
+    ]
 
-    try:
-        speed = float(raw_speed or 0)
-    except (TypeError, ValueError):
-        speed = 0.0
+    for container in (
+        current.get("telemetry"),
+        current.get("liveTelemetry"),
+        rail.get("telemetry"),
+    ):
+        if isinstance(container, dict):
+            speed_candidates.extend([
+                container.get("speedKmh"),
+                container.get("speed"),
+                container.get("speedKmph"),
+                container.get("speed_kmh"),
+                container.get("speed_kmph"),
+            ])
 
-    if speed > 0:
-        speed_display = f"{speed:.1f} km/h"
+    speed = None
+    for candidate in speed_candidates:
+        extracted = _extract_speed(candidate)
+        if extracted is not None and extracted >= 0:
+            speed = extracted
+            break
+
+    # Segment progress is documented as 0.0–1.0.
+    raw_segment_progress = current.get("segmentProgress")
+    segment_progress = _safe_float(raw_segment_progress)
+
+    if segment_progress is not None:
+        if segment_progress > 1:
+            segment_progress = segment_progress / 100.0
+        segment_progress = max(0.0, min(1.0, segment_progress))
+        segment_progress_display = f"{segment_progress * 100:.0f}%"
     else:
-        speed_display = "Telemetry unavailable"
-
-    # RailRadar may provide segment progress even when speed telemetry
-    # is unavailable. Keep it as an optional live indicator.
-    segment_progress = current.get("segmentProgress")
-    try:
-        segment_progress = float(segment_progress)
-        if 0 <= segment_progress <= 1:
-            segment_progress_display = f"{segment_progress * 100:.0f}%"
-        elif 0 <= segment_progress <= 100:
-            segment_progress_display = f"{segment_progress:.0f}%"
-        else:
-            segment_progress_display = "Unavailable"
-    except (TypeError, ValueError):
         segment_progress_display = "Unavailable"
 
-    is_live = status = rail.get("status", "unknown")
-    live_status = "LIVE" if str(status).lower() in {
-        "running", "enroute", "on-route", "active"
-    } else str(status).title()
+    segment_label, segment_distance_km = get_segment_context(
+        current,
+        route,
+        lat,
+        lon,
+    )
+
+    estimated_speed = estimate_speed_from_progress(
+        TRAIN_NUMBER,
+        segment_label,
+        segment_progress,
+        segment_distance_km,
+        now,
+    )
+
+    speed_source = "RailRadar"
+
+    if speed is None:
+        speed = estimated_speed
+        speed_source = "Estimated from live movement"
+
+    if speed is not None and speed >= 0:
+        if speed_source == "RailRadar":
+            speed_display = f"{speed:.1f} km/h"
+        else:
+            speed_display = f"~{speed:.1f} km/h"
+    else:
+        speed_display = "Calculating..."
+
+    if speed_source == "RailRadar" and speed is not None:
+        speed_note = "Direct RailRadar telemetry"
+    elif estimated_speed is not None:
+        speed_note = "Estimated from change in live segment progress"
+    else:
+        speed_note = "Refresh again to estimate movement speed"
 
     # ========================================================
     # 3. OPENWEATHER
@@ -318,10 +537,6 @@ def get_live_prediction():
     # ========================================================
     # 4. CURRENT DATE/TIME
     # ========================================================
-
-    now = datetime.now(
-        ZoneInfo("Asia/Kolkata")
-    )
 
     year = now.year
     month = now.month
@@ -451,6 +666,23 @@ def get_live_prediction():
         predicted_delay,
     )
 
+    # --------------------------------------------------------
+    # Model-attributed fog effect (counterfactual)
+    # --------------------------------------------------------
+    # This is not a causal guarantee. It measures how the trained
+    # model's prediction changes when the live fog-risk feature is
+    # replaced with a zero-fog scenario while other inputs remain fixed.
+    fog_counterfactual = data.copy()
+    fog_counterfactual["fog_risk_score"] = 0.0
+
+    X_no_fog = preprocessor.transform(fog_counterfactual)
+    predicted_delay_no_fog = float(
+        xgb_model.predict(X_no_fog)[0]
+    )
+    predicted_delay_no_fog = max(0.0, predicted_delay_no_fog)
+
+    fog_delay_effect = predicted_delay - predicted_delay_no_fog
+
     # ========================================================
     # 9. DESTINATION + SCHEDULE
     # ========================================================
@@ -518,6 +750,12 @@ def get_live_prediction():
         "Unknown",
     )
 
+    fog_effect_display = (
+        f"+{fog_delay_effect:.2f} min"
+        if fog_delay_effect >= 0
+        else f"{fog_delay_effect:.2f} min"
+    )
+
     result = f"""
 <div class="dashboard">
 
@@ -554,6 +792,7 @@ def get_live_prediction():
 <div class="card">
     <div class="card-label">CURRENT SPEED</div>
     <div class="card-value">{speed_display}</div>
+    <div class="card-note">{speed_note}</div>
 </div>
 
 </div>
@@ -563,6 +802,7 @@ def get_live_prediction():
 <div class="card small-card">
     <div class="card-label">LIVE SEGMENT PROGRESS</div>
     <div class="card-value">{segment_progress_display}</div>
+    <div class="card-note">{segment_label}</div>
 </div>
 
 <div class="card small-card">
@@ -620,6 +860,36 @@ def get_live_prediction():
 
 <div class="section-title">🤖 AI Prediction</div>
 
+<details class="explain-box">
+<summary>ⓘ How is the XGBoost prediction calculated?</summary>
+<div class="explain-content">
+
+<b>Conceptual model:</b>
+<br>
+<code>Predicted Delay = XGBoost(36 live + historical features)</code>
+
+<p>The trained XGBoost model is an ensemble of decision trees.
+The input is first passed through the saved preprocessing pipeline:
+<b>categorical features → one-hot encoding</b> and numerical features are
+passed through, then the transformed vector is given to XGBoost.</p>
+
+<b>Feature groups used by the model:</b>
+<ul>
+<li>Live train state: current delay and delayed/not-delayed state</li>
+<li>Weather: fog-risk score and seasonal weather indicators</li>
+<li>Route: distance, scheduled travel time and scheduled stops</li>
+<li>Infrastructure: electrification, track and route characteristics</li>
+<li>Train condition: maintenance, coach/loco age and utilisation</li>
+<li>Historical performance: route on-time percentage</li>
+<li>Time/calendar: month, weekday, peak hour, weekend and season</li>
+</ul>
+
+<b>Final ETA:</b>
+<code>Predicted ETA = Scheduled Arrival + Predicted Final Delay</code>
+
+</div>
+</details>
+
 <div class="prediction-card">
     <div class="prediction-label">PREDICTED FINAL DELAY</div>
     <div class="prediction-value">{predicted_delay:.2f} min</div>
@@ -628,6 +898,28 @@ def get_live_prediction():
         route characteristics and historical performance.
     </div>
 </div>
+
+<details class="explain-box fog-box">
+<summary>ⓘ How is Fog Risk calculated and how does it affect AI ETA?</summary>
+<div class="explain-content">
+
+<b>Step 1 — Fog Risk Score</b>
+<p>When visibility is at least 5 km, the score is <b>0</b>. For lower visibility, the app combines visibility and humidity.</p>
+<code>Visibility Component = (5 − visibility) / 5</code><br>
+<code>Humidity Component = (humidity − 70) / 30</code><br>
+<code>Raw Risk = 0.6 × Visibility Component + 0.4 × Humidity Component</code>
+<p>The resulting score is bounded to <b>0.32–0.88</b> for fog-risk conditions.</p>
+
+<b>Step 2 — Effect on the XGBoost prediction</b>
+<p>Fog risk is <b>not manually converted into a fixed number of minutes</b>. It is one of the model inputs.</p>
+<code>Fog Effect ≈ Prediction(actual fog risk) − Prediction(fog risk = 0)</code>
+<p><b>Current model-attributed fog effect: {fog_effect_display}</b></p>
+<p class="small-explanation">This is a model sensitivity/counterfactual estimate, not a causal guarantee that fog alone creates exactly this many minutes of delay.</p>
+
+</div>
+</details>
+
+
 
 <div class="section-title">🕐 Estimated Arrival</div>
 
@@ -778,6 +1070,62 @@ body {
     font-size: 20px;
     font-weight: 750;
     word-break: break-word;
+}
+
+.card-note {
+    color: #64748b !important;
+    margin-top: 7px;
+    font-size: 12px;
+    line-height: 1.35;
+}
+
+.explain-box {
+    margin: 14px 0 20px 0;
+    background: #eef6ff !important;
+    color: #172033 !important;
+    border: 1px solid #bfdbfe;
+    border-radius: 14px;
+    overflow: hidden;
+}
+
+.explain-box summary {
+    cursor: pointer;
+    padding: 15px 18px;
+    color: #1d4ed8 !important;
+    font-weight: 800;
+    list-style: none;
+}
+
+.explain-box summary::-webkit-details-marker {
+    display: none;
+}
+
+.explain-content {
+    padding: 0 18px 18px 18px;
+    color: #334155 !important;
+    font-size: 14px;
+    line-height: 1.55;
+}
+
+.explain-content p,
+.explain-content li,
+.explain-content b {
+    color: #334155 !important;
+}
+
+.explain-content code {
+    display: inline-block;
+    margin: 4px 0;
+    padding: 5px 8px;
+    border-radius: 7px;
+    background: #dbeafe;
+    color: #1e3a8a !important;
+    font-family: monospace;
+}
+
+.small-explanation {
+    font-size: 12px;
+    color: #64748b !important;
 }
 
 .info-panel {
