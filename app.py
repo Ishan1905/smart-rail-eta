@@ -27,10 +27,6 @@ xgb_model = None
 preprocessor = None
 feature_columns = None
 
-# Previous live telemetry snapshots used only to estimate current speed
-# when RailRadar does not return a usable speed value.
-SPEED_HISTORY = {}
-
 
 def load_model():
     global xgb_model, preprocessor, feature_columns
@@ -124,29 +120,15 @@ def calculate_fog_risk(visibility_km, humidity):
 
 
 # ============================================================
-# LIVE SPEED / SEGMENT HELPERS
+# LIVE SEGMENT HELPERS
 # ============================================================
+
 
 def _safe_float(value):
     try:
         return float(value)
     except (TypeError, ValueError):
         return None
-
-
-def _extract_speed(value):
-    """Extract a numeric km/h speed from common RailRadar fields."""
-    if isinstance(value, (int, float)):
-        return float(value)
-
-    if isinstance(value, str):
-        import re
-        match = re.search(r"[-+]?\\d+(?:\\.\\d+)?", value)
-        if match:
-            return float(match.group())
-        return None
-
-    return None
 
 
 def _haversine_km(lat1, lon1, lat2, lon2):
@@ -244,56 +226,6 @@ def get_segment_context(current, route, lat, lon):
         segment_distance_km = None
 
     return segment_label, segment_distance_km
-
-
-def estimate_speed_from_progress(
-    train_number,
-    segment_key,
-    segment_progress,
-    segment_distance_km,
-    timestamp,
-):
-    """Estimate km/h from movement between two live refreshes."""
-    if (
-        segment_progress is None
-        or segment_distance_km is None
-        or segment_distance_km <= 0
-    ):
-        return None
-
-    previous = SPEED_HISTORY.get(train_number)
-    SPEED_HISTORY[train_number] = {
-        "segment_key": segment_key,
-        "progress": segment_progress,
-        "timestamp": timestamp,
-    }
-
-    if not previous:
-        return None
-
-    if previous["segment_key"] != segment_key:
-        return None
-
-    elapsed_hours = (
-        timestamp - previous["timestamp"]
-    ).total_seconds() / 3600.0
-
-    delta_progress = segment_progress - previous["progress"]
-
-    if elapsed_hours <= 0 or delta_progress <= 0:
-        return None
-
-    speed = (
-        delta_progress
-        * segment_distance_km
-        / elapsed_hours
-    )
-
-    # Reject impossible telemetry jumps.
-    if 1 <= speed <= 180:
-        return float(speed)
-
-    return None
 
 
 # ============================================================
@@ -396,43 +328,11 @@ def get_live_prediction():
     )
 
     # --------------------------------------------------------
-    # CURRENT SPEED + SEGMENT
+    # LIVE SEGMENT PROGRESS
     # --------------------------------------------------------
 
     now = datetime.now(ZoneInfo("Asia/Kolkata"))
 
-    # RailRadar documents speed inside currentLocation. Try the
-    # documented field plus common aliases/nested telemetry fields.
-    speed_candidates = [
-        current.get("speedKmh"),
-        current.get("speed"),
-        current.get("speedKmph"),
-        current.get("speed_kmh"),
-        current.get("speed_kmph"),
-    ]
-
-    for container in (
-        current.get("telemetry"),
-        current.get("liveTelemetry"),
-        rail.get("telemetry"),
-    ):
-        if isinstance(container, dict):
-            speed_candidates.extend([
-                container.get("speedKmh"),
-                container.get("speed"),
-                container.get("speedKmph"),
-                container.get("speed_kmh"),
-                container.get("speed_kmph"),
-            ])
-
-    speed = None
-    for candidate in speed_candidates:
-        extracted = _extract_speed(candidate)
-        if extracted is not None and extracted >= 0:
-            speed = extracted
-            break
-
-    # Segment progress is documented as 0.0–1.0.
     raw_segment_progress = current.get("segmentProgress")
     segment_progress = _safe_float(raw_segment_progress)
 
@@ -450,35 +350,6 @@ def get_live_prediction():
         lat,
         lon,
     )
-
-    estimated_speed = estimate_speed_from_progress(
-        TRAIN_NUMBER,
-        segment_label,
-        segment_progress,
-        segment_distance_km,
-        now,
-    )
-
-    speed_source = "RailRadar"
-
-    if speed is None:
-        speed = estimated_speed
-        speed_source = "Estimated from live movement"
-
-    if speed is not None and speed >= 0:
-        if speed_source == "RailRadar":
-            speed_display = f"{speed:.1f} km/h"
-        else:
-            speed_display = f"~{speed:.1f} km/h"
-    else:
-        speed_display = "Calculating..."
-
-    if speed_source == "RailRadar" and speed is not None:
-        speed_note = "Direct RailRadar telemetry"
-    elif estimated_speed is not None:
-        speed_note = "Estimated from change in live segment progress"
-    else:
-        speed_note = "Refresh again to estimate movement speed"
 
     # ========================================================
     # 3. OPENWEATHER
@@ -698,6 +569,7 @@ def get_live_prediction():
             break
 
     scheduled_arrival = None
+    board_expected_time = "—"
 
     if destination_stop:
         scheduled_arrival = (
@@ -732,6 +604,8 @@ def get_live_prediction():
                 )
             )
 
+            board_expected_time = predicted_eta_dt.strftime("%I:%M")
+
         except Exception:
             scheduled_arrival_display = str(
                 scheduled_arrival
@@ -749,6 +623,13 @@ def get_live_prediction():
         "stationName",
         "Unknown",
     )
+
+    platform_value = (
+        current.get("platform")
+        or current.get("platformNumber")
+        or current.get("platformNo")
+    )
+    platform_display = str(platform_value) if platform_value else "—"
 
     # Live train status used by the dashboard header and status card.
     status = rail.get("status", "unknown")
@@ -802,20 +683,15 @@ def get_live_prediction():
     <div class="card-value">{current_delay:.0f} min</div>
 </div>
 
-<div class="card">
-    <div class="card-label">CURRENT SPEED</div>
-    <div class="card-value">{speed_display}</div>
-    <div class="card-note">{speed_note}</div>
-</div>
-
 </div>
 
 <div class="cards secondary-cards">
 
 <div class="card small-card">
-    <div class="card-label">LIVE SEGMENT PROGRESS</div>
+    <div class="card-label">CURRENT SEGMENT PROGRESS</div>
     <div class="card-value">{segment_progress_display}</div>
     <div class="card-note">{segment_label}</div>
+    <div class="card-note">Percentage completed within this current RailRadar route segment.</div>
 </div>
 
 <div class="card small-card">
@@ -866,73 +742,69 @@ def get_live_prediction():
 
 </div>
 
+<div class="section-title">🌫️ Fog Risk Intelligence</div>
+
 <div class="info-panel">
     <span>🌫️ <b>Fog Risk Score</b></span>
     <span class="score">{fog_risk_score:.2f}</span>
 </div>
 
-<div class="section-title">🤖 AI Prediction</div>
-
-<details class="explain-box">
-<summary>ⓘ How is the XGBoost prediction calculated?</summary>
+<details class="explain-box fog-box">
+<summary>ⓘ How is Fog Risk calculated and how does it affect the AI prediction?</summary>
 <div class="explain-content">
 
-<b>Conceptual model:</b>
-<br>
-<code>Predicted Delay = XGBoost(36 live + historical features)</code>
+<b>Step 1 — Calculate the weather-derived fog feature</b>
+<p>If visibility is <b>5 km or more</b>, the fog-risk feature is set to <b>0</b>. Below 5 km, visibility and humidity are combined:</p>
+<code>Visibility Component = clip((5 − visibility) / 5, 0, 1)</code><br>
+<code>Humidity Component = clip((humidity − 70) / 30, 0, 1)</code><br>
+<code>Raw Risk = 0.6 × Visibility Component + 0.4 × Humidity Component</code><br>
+<code>Fog Risk = 0.32 + Raw Risk × (0.88 − 0.32)</code>
+<p>The final engineered feature is bounded between <b>0.32 and 0.88</b> when the low-visibility calculation is active.</p>
 
-<p>The trained XGBoost model is an ensemble of decision trees.
-The input is first passed through the saved preprocessing pipeline:
-<b>categorical features → one-hot encoding</b> and numerical features are
-passed through, then the transformed vector is given to XGBoost.</p>
-
-<b>Feature groups used by the model:</b>
-<ul>
-<li>Live train state: current delay and delayed/not-delayed state</li>
-<li>Weather: fog-risk score and seasonal weather indicators</li>
-<li>Route: distance, scheduled travel time and scheduled stops</li>
-<li>Infrastructure: electrification, track and route characteristics</li>
-<li>Train condition: maintenance, coach/loco age and utilisation</li>
-<li>Historical performance: route on-time percentage</li>
-<li>Time/calendar: month, weekday, peak hour, weekend and season</li>
-</ul>
-
-<b>Final ETA:</b>
-<code>Predicted ETA = Scheduled Arrival + Predicted Final Delay</code>
+<b>Step 2 — How fog affects the AI prediction</b>
+<p>Fog is <b>not manually converted into a fixed number of delay minutes</b>. The fog-risk score is one of the features supplied to the trained XGBoost model.</p>
+<code>Model Fog Effect ≈ Prediction(actual fog) − Prediction(fog risk = 0)</code>
+<p><b>Current model-attributed effect: {fog_effect_display}</b></p>
+<p class="small-explanation">This is a model sensitivity/counterfactual comparison. It shows how the model's output changes when only the fog-risk feature is changed; it is not a causal guarantee that fog alone creates exactly this many minutes of delay.</p>
 
 </div>
 </details>
+
+<div class="section-title">🤖 AI Prediction</div>
 
 <div class="prediction-card">
     <div class="prediction-label">PREDICTED FINAL DELAY</div>
     <div class="prediction-value">{predicted_delay:.2f} min</div>
     <div class="prediction-note">
-        XGBoost prediction using live train status, weather,
-        route characteristics and historical performance.
+        Predicted final delay from the trained XGBoost model.
     </div>
 </div>
 
-<details class="explain-box fog-box">
-<summary>ⓘ How is Fog Risk calculated and how does it affect AI ETA?</summary>
+<details class="explain-box">
+<summary>ⓘ How is the XGBoost prediction calculated?</summary>
 <div class="explain-content">
 
-<b>Step 1 — Fog Risk Score</b>
-<p>When visibility is at least 5 km, the score is <b>0</b>. For lower visibility, the app combines visibility and humidity.</p>
-<code>Visibility Component = (5 − visibility) / 5</code><br>
-<code>Humidity Component = (humidity − 70) / 30</code><br>
-<code>Raw Risk = 0.6 × Visibility Component + 0.4 × Humidity Component</code>
-<p>The resulting score is bounded to <b>0.32–0.88</b> for fog-risk conditions.</p>
+<b>What the model predicts</b>
+<p>The trained model predicts <b>final delay in minutes</b>. It does not directly predict the clock time.</p>
 
-<b>Step 2 — Effect on the XGBoost prediction</b>
-<p>Fog risk is <b>not manually converted into a fixed number of minutes</b>. It is one of the model inputs.</p>
-<code>Fog Effect ≈ Prediction(actual fog risk) − Prediction(fog risk = 0)</code>
-<p><b>Current model-attributed fog effect: {fog_effect_display}</b></p>
-<p class="small-explanation">This is a model sensitivity/counterfactual estimate, not a causal guarantee that fog alone creates exactly this many minutes of delay.</p>
+<b>Step 1 — Build the 36-feature input</b>
+<p>The app combines live train state, live weather-derived information, route characteristics, infrastructure, train condition, historical performance and calendar features.</p>
+
+<b>Step 2 — Preprocess the features</b>
+<p>Categorical values are transformed using the <b>saved preprocessing pipeline</b> (one-hot encoding), while numerical features are passed through. The transformed feature vector is then supplied to XGBoost.</p>
+
+<b>Step 3 — XGBoost ensemble</b>
+<code>ŷ = base_score + Σ [learning_rate × tree_m(x)]</code>
+<p>Conceptually, XGBoost adds the contributions of many decision trees. This trained model uses <b>500 trees</b>, a <b>0.05 learning rate</b> and <b>maximum tree depth 6</b>.</p>
+
+<p>There is <b>no single hand-written equation</b> such as “delay = weather + current delay”. The final number comes from the learned decision-tree ensemble after all 36 features have been processed.</p>
+
+<b>Final ETA</b>
+<code>Predicted ETA = Scheduled Arrival + Predicted Final Delay</code>
+<p>Example: if scheduled arrival is 10:05 AM and predicted final delay is 21 minutes, the displayed AI ETA is approximately 10:26 AM.</p>
 
 </div>
 </details>
-
-
 
 <div class="section-title">🕐 Estimated Arrival</div>
 
@@ -951,6 +823,29 @@ passed through, then the transformed vector is given to XGBoost.</p>
 </div>
 
 </div>
+
+<div class="section-title">📟 Railway Display Board — Demo</div>
+
+<div class="railway-board">
+    <div class="board-head">
+        <span>TRAIN NO.</span>
+        <span>TRAIN NAME</span>
+        <span>EXPT. TIME</span>
+        <span>A/D</span>
+        <span>PF. NO.</span>
+    </div>
+    <div class="board-row">
+        <span>12301</span>
+        <span>RAJDHANI EXPRESS</span>
+        <span>{board_expected_time}</span>
+        <span>A</span>
+        <span>{platform_display}</span>
+    </div>
+    <div class="board-note">
+        Demo railway display · Expected time uses the AI-predicted ETA · Platform number is shown when the live API provides it; otherwise it is displayed as —.
+    </div>
+</div>
+
 
 <div class="footer">
     Last refreshed: {now.strftime("%d %b %Y, %I:%M:%S %p")} IST<br>
@@ -1230,6 +1125,61 @@ body {
     color: #64748b !important;
     font-size: 30px;
     font-weight: 900;
+}
+
+.railway-board {
+    margin-top: 14px;
+    padding: 0;
+    border-radius: 10px;
+    overflow: hidden;
+    background: #171717;
+    border: 2px solid #2f2f2f;
+    box-shadow: 0 10px 28px rgba(0, 0, 0, 0.35);
+}
+
+.board-head,
+.board-row {
+    display: grid;
+    grid-template-columns: 1.1fr 2.7fr 1.5fr 0.8fr 1fr;
+    align-items: center;
+    gap: 0;
+}
+
+.board-head {
+    padding: 10px 14px;
+    background: #d9d9d9;
+    color: #263b8f !important;
+    font-size: 11px;
+    font-weight: 900;
+    text-align: center;
+}
+
+.board-head span {
+    color: #263b8f !important;
+}
+
+.board-row {
+    padding: 16px 14px;
+    background: #090909;
+    color: #ff4b18 !important;
+    font-family: "Courier New", monospace;
+    font-size: 17px;
+    font-weight: 900;
+    text-align: center;
+    text-shadow: 0 0 8px rgba(255, 75, 24, 0.45);
+}
+
+.board-row span {
+    color: #ff4b18 !important;
+}
+
+.board-note {
+    padding: 10px 14px;
+    background: #202020;
+    color: #bdbdbd !important;
+    font-size: 11px;
+    line-height: 1.4;
+    text-align: center;
 }
 
 .footer {
