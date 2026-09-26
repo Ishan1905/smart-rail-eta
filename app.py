@@ -813,8 +813,6 @@ app = gr.Interface(
         "Train 12301 using RailRadar, OpenWeather "
         "and the trained XGBoost model."
     ),
-
-    allow_flagging="never"
 )
 
 
