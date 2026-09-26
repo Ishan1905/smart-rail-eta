@@ -240,7 +240,26 @@ def get_live_prediction():
     if speed > 0:
         speed_display = f"{speed:.1f} km/h"
     else:
-        speed_display = "Live telemetry unavailable"
+        speed_display = "Telemetry unavailable"
+
+    # RailRadar may provide segment progress even when speed telemetry
+    # is unavailable. Keep it as an optional live indicator.
+    segment_progress = current.get("segmentProgress")
+    try:
+        segment_progress = float(segment_progress)
+        if 0 <= segment_progress <= 1:
+            segment_progress_display = f"{segment_progress * 100:.0f}%"
+        elif 0 <= segment_progress <= 100:
+            segment_progress_display = f"{segment_progress:.0f}%"
+        else:
+            segment_progress_display = "Unavailable"
+    except (TypeError, ValueError):
+        segment_progress_display = "Unavailable"
+
+    is_live = status = rail.get("status", "unknown")
+    live_status = "LIVE" if str(status).lower() in {
+        "running", "enroute", "on-route", "active"
+    } else str(status).title()
 
     # ========================================================
     # 3. OPENWEATHER
@@ -494,7 +513,6 @@ def get_live_prediction():
     # 10. USER-FACING RESULT
     # ========================================================
 
-    status = rail.get("status", "unknown")
     current_station = current.get(
         "stationName",
         "Unknown",
@@ -504,13 +522,14 @@ def get_live_prediction():
 <div class="dashboard">
 
 <div class="hero">
-<div class="hero-title">🚆 Smart Rail ETA</div>
-<div class="hero-subtitle">
-AI-powered real-time arrival prediction
-</div>
-<div class="train-route">
-Train <b>12301</b> · Howrah → New Delhi Rajdhani Express
-</div>
+    <div class="live-pill">● {live_status.upper()}</div>
+    <div class="hero-title">🚆 Smart Rail ETA</div>
+    <div class="hero-subtitle">
+        AI-powered real-time arrival prediction
+    </div>
+    <div class="train-route">
+        Train <b>12301</b> · Howrah → New Delhi Rajdhani Express
+    </div>
 </div>
 
 <div class="section-title">📡 Live Train Intelligence</div>
@@ -518,30 +537,44 @@ Train <b>12301</b> · Howrah → New Delhi Rajdhani Express
 <div class="cards">
 
 <div class="card">
-<div class="card-label">CURRENT LOCATION</div>
-<div class="card-value">{current_station}</div>
+    <div class="card-label">CURRENT LOCATION</div>
+    <div class="card-value">{current_station}</div>
 </div>
 
 <div class="card">
-<div class="card-label">TRAIN STATUS</div>
-<div class="card-value">{status.title()}</div>
+    <div class="card-label">TRAIN STATUS</div>
+    <div class="card-value">{str(status).title()}</div>
 </div>
 
 <div class="card">
-<div class="card-label">CURRENT DELAY</div>
-<div class="card-value">{current_delay:.0f} min</div>
+    <div class="card-label">CURRENT DELAY</div>
+    <div class="card-value">{current_delay:.0f} min</div>
 </div>
 
 <div class="card">
-<div class="card-label">CURRENT SPEED</div>
-<div class="card-value">{speed_display}</div>
+    <div class="card-label">CURRENT SPEED</div>
+    <div class="card-value">{speed_display}</div>
+</div>
+
+</div>
+
+<div class="cards secondary-cards">
+
+<div class="card small-card">
+    <div class="card-label">LIVE SEGMENT PROGRESS</div>
+    <div class="card-value">{segment_progress_display}</div>
+</div>
+
+<div class="card small-card">
+    <div class="card-label">LAST REFRESHED</div>
+    <div class="card-value">{now.strftime("%I:%M:%S %p")}</div>
 </div>
 
 </div>
 
 <div class="info-panel">
-<b>📍 Coordinates</b><br>
-{lat:.5f}, {lon:.5f}
+    <span>📍 <b>Live Coordinates</b></span>
+    <span>{lat:.5f}, {lon:.5f}</span>
 </div>
 
 <div class="section-title">🌦️ Live Weather Intelligence</div>
@@ -549,73 +582,75 @@ Train <b>12301</b> · Howrah → New Delhi Rajdhani Express
 <div class="cards">
 
 <div class="card">
-<div class="card-label">CONDITION</div>
-<div class="card-value">{weather_condition.title()}</div>
+    <div class="card-label">CONDITION</div>
+    <div class="card-value">{weather_condition.title()}</div>
 </div>
 
 <div class="card">
-<div class="card-label">TEMPERATURE</div>
-<div class="card-value">{temperature:.1f} °C</div>
+    <div class="card-label">TEMPERATURE</div>
+    <div class="card-value">{temperature:.1f} °C</div>
 </div>
 
 <div class="card">
-<div class="card-label">HUMIDITY</div>
-<div class="card-value">{humidity:.0f}%</div>
+    <div class="card-label">HUMIDITY</div>
+    <div class="card-value">{humidity:.0f}%</div>
 </div>
 
 <div class="card">
-<div class="card-label">VISIBILITY</div>
-<div class="card-value">{visibility_km:.1f} km</div>
+    <div class="card-label">VISIBILITY</div>
+    <div class="card-value">{visibility_km:.1f} km</div>
 </div>
 
 <div class="card">
-<div class="card-label">PRESSURE</div>
-<div class="card-value">{pressure:.0f} hPa</div>
+    <div class="card-label">PRESSURE</div>
+    <div class="card-value">{pressure:.0f} hPa</div>
 </div>
 
 <div class="card">
-<div class="card-label">WIND</div>
-<div class="card-value">{wind_speed:.2f} m/s</div>
+    <div class="card-label">WIND</div>
+    <div class="card-value">{wind_speed:.2f} m/s</div>
 </div>
 
 </div>
 
 <div class="info-panel">
-<b>🌫️ Fog Risk Score</b>
-<span class="score">{fog_risk_score:.2f}</span>
+    <span>🌫️ <b>Fog Risk Score</b></span>
+    <span class="score">{fog_risk_score:.2f}</span>
 </div>
 
 <div class="section-title">🤖 AI Prediction</div>
 
 <div class="prediction-card">
-<div class="prediction-label">PREDICTED FINAL DELAY</div>
-<div class="prediction-value">{predicted_delay:.2f} min</div>
-<div class="prediction-note">
-XGBoost prediction using live train status, weather,
-route characteristics and historical performance.
-</div>
+    <div class="prediction-label">PREDICTED FINAL DELAY</div>
+    <div class="prediction-value">{predicted_delay:.2f} min</div>
+    <div class="prediction-note">
+        XGBoost prediction using live train status, weather,
+        route characteristics and historical performance.
+    </div>
 </div>
 
 <div class="section-title">🕐 Estimated Arrival</div>
 
 <div class="eta-panel">
+
 <div>
-<div class="eta-label">SCHEDULED ARRIVAL</div>
-<div class="eta-time">{scheduled_arrival_display}</div>
+    <div class="eta-label">SCHEDULED ARRIVAL</div>
+    <div class="eta-time">{scheduled_arrival_display}</div>
 </div>
 
 <div class="arrow">→</div>
 
 <div>
-<div class="eta-label">AI PREDICTED ETA</div>
-<div class="eta-time highlight">{predicted_eta_display}</div>
+    <div class="eta-label">AI PREDICTED ETA</div>
+    <div class="eta-time highlight">{predicted_eta_display}</div>
 </div>
+
 </div>
 
 <div class="footer">
-Last refreshed: {now.strftime("%d %b %Y, %I:%M:%S %p")} IST<br>
-Prediction combines the trained XGBoost model with live RailRadar
-and OpenWeather data.
+    Last refreshed: {now.strftime("%d %b %Y, %I:%M:%S %p")} IST<br>
+    Prediction combines the trained XGBoost model with live RailRadar
+    and OpenWeather data.
 </div>
 
 </div>
@@ -630,12 +665,13 @@ and OpenWeather data.
 
 CSS = """
 body {
-    background: #f5f7fb;
+    background: #0b1020 !important;
 }
 
 .gradio-container {
     max-width: 1200px !important;
     margin: auto !important;
+    background: #0b1020 !important;
 }
 
 #refresh-btn {
@@ -649,16 +685,26 @@ body {
 
 .dashboard {
     font-family: Arial, sans-serif;
-    color: #172033;
+    color: #172033 !important;
+}
+
+.dashboard * {
+    color: inherit;
 }
 
 .hero {
     padding: 28px;
     border-radius: 20px;
     margin-bottom: 26px;
-    background: linear-gradient(135deg, #111827, #1f3a5f);
-    color: white;
-    box-shadow: 0 12px 30px rgba(15, 23, 42, 0.15);
+    background: linear-gradient(135deg, #172554, #1e3a5f);
+    color: #ffffff !important;
+    box-shadow: 0 12px 30px rgba(0, 0, 0, 0.25);
+}
+
+.hero-title,
+.hero-subtitle,
+.train-route {
+    color: #ffffff !important;
 }
 
 .hero-title {
@@ -669,16 +715,28 @@ body {
 .hero-subtitle {
     margin-top: 6px;
     font-size: 18px;
-    opacity: 0.88;
+    opacity: 0.9;
 }
 
 .train-route {
     margin-top: 18px;
     font-size: 16px;
-    opacity: 0.95;
+}
+
+.live-pill {
+    display: inline-block;
+    padding: 7px 13px;
+    margin-bottom: 14px;
+    border-radius: 999px;
+    background: #dcfce7;
+    color: #166534 !important;
+    font-size: 12px;
+    font-weight: 900;
+    letter-spacing: 0.8px;
 }
 
 .section-title {
+    color: #f8fafc !important;
     font-size: 21px;
     font-weight: 800;
     margin: 26px 0 14px 0;
@@ -690,23 +748,32 @@ body {
     gap: 14px;
 }
 
+.secondary-cards {
+    margin-top: 14px;
+}
+
 .card {
-    background: white;
-    border: 1px solid #e5e9f2;
+    background: #ffffff !important;
+    border: 1px solid #dbe3ef;
     border-radius: 16px;
     padding: 20px;
     min-height: 86px;
-    box-shadow: 0 5px 18px rgba(15, 23, 42, 0.06);
+    box-shadow: 0 5px 18px rgba(0, 0, 0, 0.14);
+}
+
+.small-card {
+    min-height: 70px;
 }
 
 .card-label {
+    color: #52627a !important;
     font-size: 11px;
     font-weight: 800;
     letter-spacing: 0.8px;
-    color: #667085;
 }
 
 .card-value {
+    color: #172033 !important;
     margin-top: 10px;
     font-size: 20px;
     font-weight: 750;
@@ -715,44 +782,54 @@ body {
 
 .info-panel {
     margin-top: 14px;
-    background: white;
-    border: 1px solid #e5e9f2;
+    background: #ffffff !important;
+    color: #172033 !important;
+    border: 1px solid #dbe3ef;
     border-radius: 16px;
     padding: 17px 20px;
-    box-shadow: 0 5px 18px rgba(15, 23, 42, 0.05);
+    display: flex;
+    justify-content: space-between;
+    gap: 16px;
+    box-shadow: 0 5px 18px rgba(0, 0, 0, 0.12);
+}
+
+.info-panel span {
+    color: #172033 !important;
 }
 
 .score {
-    float: right;
+    color: #2563eb !important;
     font-size: 20px;
     font-weight: 800;
 }
 
 .prediction-card {
-    background: linear-gradient(135deg, #eef6ff, #f7fbff);
-    border: 1px solid #cfe2ff;
+    background: linear-gradient(135deg, #eff6ff, #ffffff) !important;
+    color: #172033 !important;
+    border: 1px solid #bfdbfe;
     border-radius: 20px;
     padding: 28px;
     text-align: center;
-    box-shadow: 0 8px 24px rgba(37, 99, 235, 0.08);
+    box-shadow: 0 8px 24px rgba(37, 99, 235, 0.12);
 }
 
 .prediction-label {
+    color: #52627a !important;
     font-size: 13px;
     font-weight: 800;
     letter-spacing: 1px;
-    color: #4b6380;
 }
 
 .prediction-value {
+    color: #172033 !important;
     font-size: 42px;
     font-weight: 900;
     margin-top: 8px;
 }
 
 .prediction-note {
+    color: #52627a !important;
     margin-top: 10px;
-    color: #64748b;
     font-size: 14px;
 }
 
@@ -761,40 +838,44 @@ body {
     align-items: center;
     justify-content: space-between;
     gap: 20px;
-    background: white;
-    border: 1px solid #e5e9f2;
+    background: #ffffff !important;
+    color: #172033 !important;
+    border: 1px solid #dbe3ef;
     border-radius: 20px;
     padding: 24px;
-    box-shadow: 0 8px 24px rgba(15, 23, 42, 0.06);
+    box-shadow: 0 8px 24px rgba(0, 0, 0, 0.12);
 }
 
 .eta-label {
+    color: #52627a !important;
     font-size: 11px;
     font-weight: 800;
     letter-spacing: 0.8px;
-    color: #667085;
 }
 
 .eta-time {
+    color: #172033 !important;
     margin-top: 7px;
     font-size: 20px;
     font-weight: 800;
 }
 
 .highlight {
+    color: #2563eb !important;
     font-size: 24px;
 }
 
 .arrow {
+    color: #64748b !important;
     font-size: 30px;
     font-weight: 900;
 }
 
 .footer {
+    color: #94a3b8 !important;
     text-align: center;
     margin-top: 28px;
     padding: 18px;
-    color: #667085;
     font-size: 13px;
 }
 
@@ -803,7 +884,8 @@ body {
         font-size: 27px;
     }
 
-    .eta-panel {
+    .eta-panel,
+    .info-panel {
         flex-direction: column;
         align-items: stretch;
     }
@@ -814,6 +896,7 @@ body {
     }
 }
 """
+
 
 
 with gr.Blocks(
@@ -843,10 +926,11 @@ trained XGBoost model
 
     result = gr.Markdown(
         """
-<div style="text-align:center; padding:50px 20px;">
-    <h2>👋 Ready for live prediction</h2>
-    <p>Click <b>Refresh Live Data & Predict ETA</b> to fetch the latest
-    train status, weather and AI prediction.</p>
+<div style="text-align:center; padding:50px 20px; color:#e5e7eb;">
+    <h2 style="color:#f8fafc;">👋 Ready for live prediction</h2>
+    <p style="color:#cbd5e1;">Click <b style="color:#ffffff;">
+    Refresh Live Data & Predict ETA</b> to fetch the latest train status,
+    weather and AI prediction.</p>
 </div>
 """
     )
